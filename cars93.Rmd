@@ -1,0 +1,363 @@
+---
+title: "Cars93"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(scatterPlotMatrix)
+library(ggplot2)
+library(tidyr)
+library(GGally)
+library(car)
+library(kableExtra)
+library(psych)
+library(nortest)
+library(ppcor)
+library(corrplot)
+library(fastDummies)
+library(olsrr)
+library(MASS)
+library(lm.beta)
+```
+
+# 1. Загрузка данных
+```{r}
+df <- read_xls("./93CARS.STD/93CARS_shortname.xls", na = "_")
+colnames(df)[19] <- "LENGTH"
+df <-
+  df |>
+  filter(!(TYPE %in% c("VAN", "SPORTY"))) |>
+  dplyr::select(-MANUFACT, -MODEL, -MIN_PRIC, -MAX_PRIC)
+head(df)
+```
+
+# 2. Подготовка данных к линейной регресии
+
+Посмотрим на распределения признаков и графики зависимостей
+
+```{r}
+categorical <- vector(length = 22, mode = "list")
+categorical[[1]] <- c("SMALL", "MIDSIZE", "COMPACT", "LARGE", "SPORTY", "VAN")
+categorical[[5]] <- c("NONE", "DRIV", "DRIV_PAS")
+categorical[[6]] <- c("FRONT", "REAR", "ALL")
+categorical[[7]] <- c(3, 4, 5, 6, 8)
+categorical[[12]] <- c("YES", "NO")
+categorical[[14]] <- c(2, 4:8)
+categorical[[22]] <- c("NON_US", "US")
+df |>
+  scatterPlotMatrix(regressionType = 0,
+                    corrPlotType = "Text",
+                    categorical = categorical,
+                    plotProperties = list(noCatColor = "Indigo"),
+                    controlWidgets = TRUE,
+                    height = 1050,
+                    width = 1000)
+```
+
+Признаки MID_PRIC, CITY_MPG, HIGH_MPG, ENGINE, HORSEPOW имеют выраженный хвост справа, пролагарифмируем их.
+```{r}
+df.log <-
+  df |>
+  mutate(
+    MID_PRIC_LOG = log(MID_PRIC),
+    CITY_MPG_LOG = log(CITY_MPG),
+    HIGH_MPG_LOG = log(HIGH_MPG),
+    ENGINE_LOG = log(ENGINE),
+    HORSEPOW_LOG = log(HORSEPOW),
+    ) |>
+  dplyr::select(
+    TYPE,
+    MID_PRIC_LOG,
+    CITY_MPG_LOG,
+    HIGH_MPG_LOG,
+    AIR_BAGS,
+    DRIVE,
+    CYLINDER,
+    ENGINE_LOG,
+    HORSEPOW_LOG,
+    RPM,
+    ENG_REV,
+    MANTRANS,
+    FUEL_CAP,
+    PASS_CAP,
+    LENGTH,
+    WHEELBAS,
+    WIDTH,
+    U_SPACE,
+    SEATROOM,
+    LUGG_CAP,
+    WEIGHT,
+    DOMESTIC
+  )
+
+
+df.log |>
+  scatterPlotMatrix(regressionType = 0,
+                    corrPlotType = "Text",
+                    categorical = categorical,
+                    plotProperties = list(noCatColor = "Indigo"),
+                    controlWidgets = TRUE,
+                    height = 1050,
+                    width = 1000)
+```
+
+Стало симметричней, но не сильно, например CITY_MPG все еще имеет хвост справа.
+
+# 3. Линейная регрессия
+
+Будем строить линейную регрессию средней цены автомобиля на остальные признаки.
+
+```{r}
+df.dummy <-
+  dummy_cols(df.log) |>
+  dplyr::select(
+    -TYPE,
+    -AIR_BAGS,
+    -DRIVE,
+    -MANTRANS,
+    -DOMESTIC,
+    -TYPE_COMPACT,
+    -AIR_BAGS_DRIV,
+    -DRIVE_ALL,
+    -MANTRANS_NO,
+    -DOMESTIC_NON_US
+  )
+model <- lm(MID_PRIC_LOG ~ . , data = df.dummy)
+summary(model)
+```
+
+Получили, что при уровне значимости $\alpha=0.05$ значимые признаки: AIR_BAGS_NONE, WIDTH, CITY_MPG_LOG и HORSEPOW_LOG.
+
+Посмотрим также на стандартизованные коэффициенты регрессии.
+```{r}
+summary(lm.beta(model))
+```
+Все стандартизованные коэффициенты по модулю меньше 1, значит пока нет оснований считать, что присутствуют супрессоры. Посмотрим на корреляцию между значимыми признаками.
+
+```{r}
+corrplot(
+  df.dummy |> dplyr::select(AIR_BAGS_NONE, WIDTH, CITY_MPG_LOG, HORSEPOW_LOG) |> cor(),
+  method = "number"
+)
+```
+
+Признак HORRSEPOW_LOG сильно коррелирует с признаками WIDTH и CITY_MPG_LOG. Посмотрим на доверительные эллипсоиды.
+
+```{r}
+df.scale <- as.data.frame(scale(df.dummy))
+model.lm.scale <- lm(MID_PRIC_LOG ~ ., data = df.scale)
+```
+
+```{r}
+confidenceEllipse(model.lm.scale, which.coef = c("HORSEPOW_LOG", "WIDTH"), levels = 0.9, col = "blue")
+abline(0, -1, lty = 2)
+abline(h = 0, v = 0, lwd = 2)
+```
+
+```{r}
+confidenceEllipse(model.lm.scale, which.coef = c("HORSEPOW_LOG", "CITY_MPG_LOG"), levels = 0.9, col = "blue")
+abline(0, -1, lty = 2)
+abline(h = 0, v = 0, lwd = 2)
+```
+
+Ситуация не очень хорошая в обоих случаях. Проверим мультеколлинеарность.
+```{r}
+ols_vif_tol(model)
+```
+Будем убирать с регресси незначимые признаки по одному с VIF > 10, пока модель улучшается.
+
+```{r}
+model.reduced <- lm(MID_PRIC_LOG ~ . - ENGINE_LOG - WEIGHT - WHEELBAS - LENGTH, data = df.dummy)
+summary(model.reduced)
+AIC(model.reduced)
+```
+
+Итоговые VIF:
+```{r}
+ols_vif_tol(model.reduced)
+```
+Признак HIGH_MPG_LOG не был удален, поскольку без него модель становится хуже.
+
+Теперь посмотрим на частные корреляции с откликом и уберем те признаки, которые с ним особо не коррелируют.
+```{r}
+ols_correlations(model.reduced)
+```
+Также тут удаляем по одному и смотрим, как ведет себя модель. Получаем следующую модель:
+```{r}
+df.reduced <-
+  df.dummy |> dplyr::select(-ENGINE_LOG,-WEIGHT,-WHEELBAS,-LENGTH)
+model.reduced <-
+  lm(MID_PRIC_LOG ~ . - RPM - FUEL_CAP - LUGG_CAP - TYPE_LARGE - DRIVE_FRONT - MANTRANS_YES,
+     data = df.reduced)
+summary(model.reduced)
+AIC(model.reduced)
+```
+
+Adjusted $R^2$ вырос, значимость регрессии тоже. Теперь значимыми признаками являются CITY_MPG_LOG, CYLINDER, HORSEPOW_LOG, WIDTH, TYPE_MIDSIZE, AIR_BAGS_NONE и DRIVE_REAR.
+
+```{r}
+ols_vif_tol(model.reduced)
+ols_correlations(model.reduced)
+```
+
+Перейдем к автоматической пошаговой регрессии по AIC.
+```{r}
+fwd <- ols_step_forward_p(model.reduced)
+fwd
+plot(fwd)
+AIC(fwd$model)
+```
+
+```{r}
+bwd <- ols_step_backward_p(model.reduced)
+bwd
+plot(bwd)
+AIC(bwd$model)
+```
+
+Forward stepwise дает меньший AIC и более значимую регрессию, поэтому остановимся на этой модели.
+```{r}
+model.stepwise <- fwd$model
+summary(model.stepwise)
+```
+
+```{r}
+ols_vif_tol(model.stepwise)
+ols_correlations(model.stepwise)
+```
+
+Остановимся на этой модели.
+
+# 4. Проверка модели
+```{r}
+plot(model.stepwise, which = 1)
+```
+
+По графику Residuals vs Predicted видно, что модель не совсем линейная, что, действительно, можно увидеть, взглянув на pairs оставшихся признаков.
+```{r}
+df.new <-
+  df.dummy |> dplyr::select(
+    MID_PRIC_LOG,
+    CITY_MPG_LOG,
+    HIGH_MPG_LOG,
+    HORSEPOW_LOG,
+    ENG_REV,
+    WIDTH,
+    SEATROOM,
+    CYLINDER,
+    AIR_BAGS_DRIV_PAS,
+    AIR_BAGS_NONE,
+    TYPE_MIDSIZE,
+    DRIVE_REAR
+  )
+
+df.new[, 1:7] |>
+  scatterPlotMatrix(
+    regressionType = 0,
+    corrPlotType = "Text",
+    plotProperties = list(noCatColor = "Indigo"),
+    controlWidgets = TRUE,
+    height = 1000,
+    width = 900
+  )
+```
+
+Проверим нормальность остатков.
+```{r}
+plot(model.stepwise, which = 2)
+```
+
+Не очень похоже на нормальное распределение. Проверим остатки на гомоскедастичность.
+```{r}
+plot(model.stepwise, which = 3)
+```
+
+Скорее всего, дисперсия постоянная.
+
+# 5. Выбросы
+Теперь займемся определением выбросов. Сначала посмотрим на график Deleted Residuals vs Residuals
+```{r}
+deleted_resid <- studres(model.stepwise)
+resid <- rstandard(model.stepwise)
+plot(deleted_resid ~ resid, xlab = "Standart Residuals", ylab = "Studentized Residuals")
+abline(lm(deleted_resid ~ resid), col = "red")
+```
+
+Почти все точки лежат на прямой, выбросов не обнаружено.
+
+
+Теперь посмотрим на аутлаеры по Куку и Махаланобису. Чтобы было наглядней, отсортируем расстояния по убыванию.
+```{r}
+cooks_distance <- cooks.distance(model.stepwise)
+
+plot(cooks_distance[order(cooks_distance, decreasing = TRUE)], 
+     col = "darkblue",
+     type = "h", 
+     main = "Cook's Distance",
+     xlab = "Number by order",
+     ylab = "Cook's Distance")
+```
+
+Похоже, первые 3 с наибольшим расстоянием Кука являются выбросами, поскольку имеется резкий скачок. Это признаки 45, 59 и 44.
+```{r}
+regressors <-
+  df.new |> dplyr::select(-MID_PRIC_LOG)
+
+mahalanobis_distance <- mahalanobis(regressors, colMeans(regressors), cov(regressors))
+
+plot(mahalanobis_distance[order(mahalanobis_distance, decreasing = TRUE)], 
+     main = "Mahalanobis Distance Plot",
+     xlab = "Number by order",
+     ylab = "Mahalanobis Distance",
+     type = "h", 
+     col = "darkblue") 
+```
+
+Здесь выбросы не видны.
+```{r}
+ols_plot_resid_lev(model.stepwise)
+```
+
+Тут тоже выбросы не наблюдаются, поскольку 5% данных, выходящих за $2\sigma$, допустимо.
+
+Давайте тогда удалим подозрительные наблюдения и посмотрим, улучшится ли модель.
+```{r}
+df.clear <- df.new[-c(45, 59, 44), ]
+model.clear <- lm(MID_PRIC_LOG ~ ., data = df.clear)
+summary(model.clear)
+AIC(model.clear)
+```
+
+Модель стала лучше, оставим ее.
+
+# 6. Предсказание
+Теперь займемся предсказанием. Добавим Kia Rio 2023.
+```{r}
+kia_rio <-
+  data.frame(
+    CITY_MPG_LOG = log(32),
+    HIGH_MPG_LOG = log(41),
+    HORSEPOW_LOG = log(120),
+    ENG_REV = 2400,
+    WIDTH = 67.9,
+    SEATROOM = 33.5,
+    CYLINDER = 4,
+    AIR_BAGS_DRIV_PAS = 1,
+    AIR_BAGS_NONE = 0,
+    TYPE_MIDSIZE = 0,
+    DRIVE_REAR = 0
+  )
+
+pred.conf <- predict(model.clear, newdata = kia_rio, interval = "confidence")
+pred.predict <- predict(model.clear, newdata = kia_rio, interval = "prediction")
+
+pred <- cbind(matrix(pred.conf, nrow = 1), matrix(pred.predict[, 2:3], nrow = 1))
+colnames(pred) <- c("fit", "conf.lwr", "conf.upr", "pred.lwr", "pred.upr")
+exp(pred)
+```
+Настоящая средняя цена (приблизительно) -- 18.375 тыс $.
